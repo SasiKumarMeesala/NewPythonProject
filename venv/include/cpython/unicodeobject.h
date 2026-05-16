@@ -834,12 +834,34 @@ PyAPI_FUNC(PyObject*) _PyUnicode_EncodeUTF16(
 
 /* --- Unicode-Escape Codecs ---------------------------------------------- */
 
-/* Helper for PyUnicode_DecodeUnicodeEscape that detects invalid escape
-   chars. */
-PyAPI_FUNC(PyObject*) _PyUnicode_DecodeUnicodeEscape(
+/* Variant of PyUnicode_DecodeUnicodeEscape that supports partial decoding. */
+PyAPI_FUNC(PyObject*) _PyUnicode_DecodeUnicodeEscapeStateful(
         const char *string,     /* Unicode-Escape encoded string */
         Py_ssize_t length,      /* size of string */
         const char *errors,     /* error handling */
+        Py_ssize_t *consumed    /* bytes consumed */
+);
+
+/* Helper for PyUnicode_DecodeUnicodeEscape that detects invalid escape
+   chars. */
+PyAPI_FUNC(PyObject*) _PyUnicode_DecodeUnicodeEscapeInternal2(
+    const char *string,     /* Unicode-Escape encoded string */
+    Py_ssize_t length,      /* size of string */
+    const char *errors,     /* error handling */
+    Py_ssize_t *consumed,   /* bytes consumed */
+    int *first_invalid_escape_char, /* on return, if not -1, contain the first
+                                       invalid escaped char (<= 0xff) or invalid
+                                       octal escape (> 0xff) in string. */
+    const char **first_invalid_escape_ptr); /* on return, if not NULL, may
+                                        point to the first invalid escaped
+                                        char in string.
+                                        May be NULL if errors is not NULL. */
+// Export for binary compatibility.
+PyAPI_FUNC(PyObject*) _PyUnicode_DecodeUnicodeEscapeInternal(
+        const char *string,     /* Unicode-Escape encoded string */
+        Py_ssize_t length,      /* size of string */
+        const char *errors,     /* error handling */
+        Py_ssize_t *consumed,   /* bytes consumed */
         const char **first_invalid_escape  /* on return, points to first
                                               invalid escaped char in
                                               string. */
@@ -856,6 +878,14 @@ Py_DEPRECATED(3.3) PyAPI_FUNC(PyObject*) PyUnicode_EncodeRawUnicodeEscape(
     const Py_UNICODE *data,     /* Unicode char buffer */
     Py_ssize_t length           /* Number of Py_UNICODE chars to encode */
     );
+
+/* Variant of PyUnicode_DecodeRawUnicodeEscape that supports partial decoding. */
+PyAPI_FUNC(PyObject*) _PyUnicode_DecodeRawUnicodeEscapeStateful(
+        const char *string,     /* Unicode-Escape encoded string */
+        Py_ssize_t length,      /* size of string */
+        const char *errors,     /* error handling */
+        Py_ssize_t *consumed    /* bytes consumed */
+);
 
 /* --- Latin-1 Codecs ----------------------------------------------------- */
 

@@ -70,6 +70,7 @@ Req-sent-unread-response       _CS_REQ_SENT       <response_class>
 
 import email.parser
 import email.message
+import errno
 import http
 import io
 import re
@@ -109,6 +110,11 @@ responses = {v: v.phrase for v in http.HTTPStatus.__members__.values()}
 # maximal line length when calling readline().
 _MAXLINE = 65536
 _MAXHEADERS = 100
+
+# Data larger than this will be read in chunks, to prevent extreme
+# overallocation.
+_MIN_READ_BUF_SIZE = 1 << 20
+
 
 # Header name/value ABNF (http://tools.ietf.org/html/rfc7230#section-3.2)
 #
@@ -447,6 +453,7 @@ class HTTPResponse(io.BufferedIOBase):
         return self.fp is None
 
     def read(self, amt=None):
+        """Read and return the response body, or up to the next amt bytes."""
         if self.fp is None:
             return b""
 
@@ -626,10 +633,25 @@ class HTTPResponse(io.BufferedIOBase):
         reading. If the bytes are truly not available (due to EOF), then the
         IncompleteRead exception can be used to detect the problem.
         """
-        data = self.fp.read(amt)
-        if len(data) < amt:
-            raise IncompleteRead(data, amt-len(data))
-        return data
+        cursize = min(amt, _MIN_READ_BUF_SIZE)
+        data = self.fp.read(cursize)
+        if len(data) >= amt:
+            return data
+        if len(data) < cursize:
+            raise IncompleteRead(data, amt - len(data))
+
+        data = io.BytesIO(data)
+        data.seek(0, 2)
+        while True:
+            # This is a geometric increase in read size (never more than
+            # doubling out the current length of data per loop iteration).
+            delta = min(cursize, amt - cursize)
+            data.write(self.fp.read(delta))
+            if data.tell() >= amt:
+                return data.getvalue()
+            cursize += delta
+            if data.tell() < cursize:
+                raise IncompleteRead(data.getvalue(), amt - data.tell())
 
     def _safe_readinto(self, b):
         """Same as _safe_read, but for reading into a buffer."""
@@ -939,7 +961,12 @@ class HTTPConnection:
         sys.audit("http.client.connect", self, self.host, self.port)
         self.sock = self._create_connection(
             (self.host,self.port), self.timeout, self.source_address)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Might fail in OSs that don't implement TCP_NODELAY
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if e.errno != errno.ENOPROTOOPT:
+                raise
 
         if self._tunnel_host:
             self._tunnel()

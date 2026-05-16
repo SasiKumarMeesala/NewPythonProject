@@ -330,7 +330,7 @@ elif os.name == "posix":
                 return None
             for fullname in (name, "lib%s.so" % (name)):
                 path = os.path.join(sys.prefix, 'lib', fullname)
-                if os.path.exists(path):
+                if os.path.exists(path) and not os.path.isdir(path):
                     return path
             return None
 

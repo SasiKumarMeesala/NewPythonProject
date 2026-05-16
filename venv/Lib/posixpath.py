@@ -35,7 +35,7 @@ __all__ = ["normcase","isabs","join","splitdrive","split","splitext",
            "samefile","sameopenfile","samestat",
            "curdir","pardir","sep","pathsep","defpath","altsep","extsep",
            "devnull","realpath","supports_unicode_filenames","relpath",
-           "commonpath"]
+           "commonpath", "ALLOW_MISSING"]
 
 
 def _get_sep(path):
@@ -195,6 +195,7 @@ def ismount(path):
         if stat.S_ISLNK(s1.st_mode):
             return False
 
+    path = os.fspath(path)
     if isinstance(path, bytes):
         parent = join(path, b'..')
     else:
@@ -278,42 +279,41 @@ def expanduser(path):
 # This expands the forms $variable and ${variable} only.
 # Non-existent variables are left unchanged.
 
-_varprog = None
-_varprogb = None
+_varpattern = r'\$(\w+|\{[^}]*\}?)'
+_varsub = None
+_varsubb = None
 
 def expandvars(path):
     """Expand shell variables of form $var and ${var}.  Unknown variables
     are left unchanged."""
     path = os.fspath(path)
-    global _varprog, _varprogb
+    global _varsub, _varsubb
     if isinstance(path, bytes):
         if b'$' not in path:
             return path
-        if not _varprogb:
+        if not _varsubb:
             import re
-            _varprogb = re.compile(br'\$(\w+|\{[^}]*\})', re.ASCII)
-        search = _varprogb.search
+            _varsubb = re.compile(_varpattern.encode(), re.ASCII).sub
+        sub = _varsubb
         start = b'{'
         end = b'}'
         environ = getattr(os, 'environb', None)
     else:
         if '$' not in path:
             return path
-        if not _varprog:
+        if not _varsub:
             import re
-            _varprog = re.compile(r'\$(\w+|\{[^}]*\})', re.ASCII)
-        search = _varprog.search
+            _varsub = re.compile(_varpattern, re.ASCII).sub
+        sub = _varsub
         start = '{'
         end = '}'
         environ = os.environ
-    i = 0
-    while True:
-        m = search(path, i)
-        if not m:
-            break
-        i, j = m.span(0)
-        name = m.group(1)
-        if name.startswith(start) and name.endswith(end):
+
+    def repl(m):
+        name = m[1]
+        if name.startswith(start):
+            if not name.endswith(end):
+                return m[0]
             name = name[1:-1]
         try:
             if environ is None:
@@ -321,13 +321,11 @@ def expandvars(path):
             else:
                 value = environ[name]
         except KeyError:
-            i = j
+            return m[0]
         else:
-            tail = path[j:]
-            path = path[:i] + value
-            i = len(path)
-            path += tail
-    return path
+            return value
+
+    return sub(repl, path)
 
 
 # Normalize a path, e.g. A//B, A/./B and A/foo/../B all become A/B.
@@ -352,7 +350,7 @@ def normpath(path):
     initial_slashes = path.startswith(sep)
     # POSIX allows one or two initial slashes, but treats three or more
     # as single slash.
-    # (see http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_13)
+    # (see https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap04.html#tag_04_13)
     if (initial_slashes and
         path.startswith(sep*2) and not path.startswith(sep*3)):
         initial_slashes = 2
@@ -406,6 +404,15 @@ def _joinrealpath(path, rest, strict, seen):
         sep = '/'
         curdir = '.'
         pardir = '..'
+        getcwd = os.getcwd
+    if strict is ALLOW_MISSING:
+        ignored_error = FileNotFoundError
+    elif strict:
+        ignored_error = ()
+    else:
+        ignored_error = OSError
+
+    maxlinks = None
 
     if isabs(rest):
         rest = rest[1:]
@@ -428,9 +435,7 @@ def _joinrealpath(path, rest, strict, seen):
         newpath = join(path, name)
         try:
             st = os.lstat(newpath)
-        except OSError:
-            if strict:
-                raise
+        except ignored_error:
             is_link = False
         else:
             is_link = stat.S_ISLNK(st.st_mode)

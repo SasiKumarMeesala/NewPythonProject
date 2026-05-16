@@ -9,6 +9,7 @@ import io
 import itertools
 import os
 import posixpath
+import re
 import shutil
 import stat
 import struct
@@ -185,6 +186,8 @@ def _strip_extra(extra, xids):
         i = j
     if not modified:
         return extra
+    if start != len(extra):
+        buffer.append(extra[start:])
     return b''.join(buffer)
 
 def _check_zipfile(fp):
@@ -207,7 +210,7 @@ def is_zipfile(filename):
         else:
             with open(filename, "rb") as fp:
                 result = _check_zipfile(fp)
-    except OSError:
+    except (OSError, BadZipFile):
         pass
     return result
 
@@ -215,16 +218,15 @@ def _EndRecData64(fpin, offset, endrec):
     """
     Read the ZIP64 end-of-archive records and use that to update endrec
     """
-    try:
-        fpin.seek(offset - sizeEndCentDir64Locator, 2)
-    except OSError:
-        # If the seek fails, the file is not large enough to contain a ZIP64
+    offset -= sizeEndCentDir64Locator
+    if offset < 0:
+        # The file is not large enough to contain a ZIP64
         # end-of-archive record, so just return the end record we were given.
         return endrec
-
+    fpin.seek(offset)
     data = fpin.read(sizeEndCentDir64Locator)
     if len(data) != sizeEndCentDir64Locator:
-        return endrec
+        raise OSError("Unknown I/O error")
     sig, diskno, reloff, disks = struct.unpack(structEndArchive64Locator, data)
     if sig != stringEndArchive64Locator:
         return endrec
@@ -232,16 +234,33 @@ def _EndRecData64(fpin, offset, endrec):
     if diskno != 0 or disks > 1:
         raise BadZipFile("zipfiles that span multiple disks are not supported")
 
-    # Assume no 'zip64 extensible data'
-    fpin.seek(offset - sizeEndCentDir64Locator - sizeEndCentDir64, 2)
+    offset -= sizeEndCentDir64
+    if reloff > offset:
+        raise BadZipFile("Corrupt zip64 end of central directory locator")
+    # First, check the assumption that there is no prepended data.
+    fpin.seek(reloff)
+    extrasz = offset - reloff
     data = fpin.read(sizeEndCentDir64)
     if len(data) != sizeEndCentDir64:
-        return endrec
+        raise OSError("Unknown I/O error")
+    if not data.startswith(stringEndArchive64) and reloff != offset:
+        # Since we already have seen the Zip64 EOCD Locator, it's
+        # possible we got here because there is prepended data.
+        # Assume no 'zip64 extensible data'
+        fpin.seek(offset)
+        extrasz = 0
+        data = fpin.read(sizeEndCentDir64)
+        if len(data) != sizeEndCentDir64:
+            raise OSError("Unknown I/O error")
+    if not data.startswith(stringEndArchive64):
+        raise BadZipFile("Zip64 end of central directory record not found")
+
     sig, sz, create_version, read_version, disk_num, disk_dir, \
         dircount, dircount2, dirsize, diroffset = \
         struct.unpack(structEndArchive64, data)
-    if sig != stringEndArchive64:
-        return endrec
+    if (diroffset + dirsize != reloff or
+        sz + 12 != sizeEndCentDir64 + extrasz):
+        raise BadZipFile("Corrupt zip64 end of central directory record")
 
     # Update the original endrec using data from the ZIP64 record
     endrec[_ECD_SIGNATURE] = sig
@@ -251,6 +270,7 @@ def _EndRecData64(fpin, offset, endrec):
     endrec[_ECD_ENTRIES_TOTAL] = dircount2
     endrec[_ECD_SIZE] = dirsize
     endrec[_ECD_OFFSET] = diroffset
+    endrec[_ECD_LOCATION] = offset - extrasz
     return endrec
 
 
@@ -284,7 +304,7 @@ def _EndRecData(fpin):
         endrec.append(filesize - sizeEndCentDir)
 
         # Try to read the "Zip64 end of central directory" structure
-        return _EndRecData64(fpin, -sizeEndCentDir, endrec)
+        return _EndRecData64(fpin, filesize - sizeEndCentDir, endrec)
 
     # Either this is not a ZIP file, or it is a ZIP file with an archive
     # comment.  Search the end of the file for the "end of central directory"
@@ -308,8 +328,7 @@ def _EndRecData(fpin):
         endrec.append(maxCommentStart + start)
 
         # Try to read the "Zip64 end of central directory" structure
-        return _EndRecData64(fpin, maxCommentStart + start - filesize,
-                             endrec)
+        return _EndRecData64(fpin, maxCommentStart + start, endrec)
 
     # Unable to find a valid end of central directory structure
     return None
@@ -339,6 +358,7 @@ class ZipInfo (object):
         'compress_size',
         'file_size',
         '_raw_time',
+        '_end_offset',
     )
 
     def __init__(self, filename="NoName", date_time=(1980,1,1,0,0,0)):
@@ -380,6 +400,7 @@ class ZipInfo (object):
         self.external_attr = 0          # External file attributes
         self.compress_size = 0          # Size of the compressed file
         self.file_size = 0              # Size of the uncompressed file
+        self._end_offset = None         # Start of the next local header or central directory
         # Other attributes are set by class ZipFile:
         # header_offset         Byte offset to the file header
         # CRC                   CRC-32 of the uncompressed file
@@ -721,7 +742,9 @@ class _SharedFile:
         self._lock = lock
         self._writing = writing
         self.seekable = file.seekable
-        self.tell = file.tell
+
+    def tell(self):
+        return self._pos
 
     def seek(self, offset, whence=0):
         with self._lock:
@@ -1121,8 +1144,15 @@ class _ZipWriteFile(io.BufferedIOBase):
     def write(self, data):
         if self.closed:
             raise ValueError('I/O operation on closed file.')
-        nbytes = len(data)
+
+        # Accept any data that supports the buffer protocol
+        if isinstance(data, (bytes, bytearray)):
+            nbytes = len(data)
+        else:
+            data = memoryview(data)
+            nbytes = data.nbytes
         self._file_size += nbytes
+
         self._crc = crc32(data, self._crc)
         if self._compressor:
             data = self._compressor.compress(data)
@@ -1331,15 +1361,14 @@ class ZipFile:
 
         # "concat" is zero, unless zip was concatenated to another file
         concat = endrec[_ECD_LOCATION] - size_cd - offset_cd
-        if endrec[_ECD_SIGNATURE] == stringEndArchive64:
-            # If Zip64 extension structures are present, account for them
-            concat -= (sizeEndCentDir64 + sizeEndCentDir64Locator)
 
         if self.debug > 2:
             inferred = concat + offset_cd
             print("given, inferred, offset", offset_cd, inferred, concat)
         # self.start_dir:  Position of start of central directory
         self.start_dir = offset_cd + concat
+        if self.start_dir < 0:
+            raise BadZipFile("Bad offset for central directory")
         fp.seek(self.start_dir, 0)
         data = fp.read(size_cd)
         fp = io.BytesIO(data)
@@ -1391,6 +1420,12 @@ class ZipFile:
             if self.debug > 2:
                 print("total", total)
 
+        end_offset = self.start_dir
+        for zinfo in sorted(self.filelist,
+                            key=lambda zinfo: zinfo.header_offset,
+                            reverse=True):
+            zinfo._end_offset = end_offset
+            end_offset = zinfo.header_offset
 
     def namelist(self):
         """Return a list of file names in the archive."""
@@ -1545,6 +1580,10 @@ class ZipFile:
                 raise BadZipFile(
                     'File name in directory %r and header %r differ.'
                     % (zinfo.orig_filename, fname))
+
+            if (zinfo._end_offset is not None and
+                zef_file.tell() + zinfo.compress_size > zinfo._end_offset):
+                raise BadZipFile(f"Overlapped entries: {zinfo.orig_filename!r} (possible zip bomb)")
 
             # check for encrypted flag & handle password
             is_encrypted = zinfo.flag_bits & 0x1
@@ -1902,7 +1941,7 @@ class ZipFile:
                                    " would require ZIP64 extensions")
             zip64endrec = struct.pack(
                 structEndArchive64, stringEndArchive64,
-                44, 45, 45, 0, 0, centDirCount, centDirCount,
+                sizeEndCentDir64 - 12, 45, 45, 0, 0, centDirCount, centDirCount,
                 centDirSize, centDirOffset)
             self.fp.write(zip64endrec)
 
@@ -2126,7 +2165,7 @@ def _parents(path):
 def _ancestry(path):
     """
     Given a path with elements separated by
-    posixpath.sep, generate all elements of that path
+    posixpath.sep, generate all elements of that path.
 
     >>> list(_ancestry('b/d'))
     ['b/d', 'b']
@@ -2138,9 +2177,14 @@ def _ancestry(path):
     ['b']
     >>> list(_ancestry(''))
     []
+
+    Multiple separators are treated like a single.
+
+    >>> list(_ancestry('//b//d///f//'))
+    ['//b//d///f', '//b//d', '//b']
     """
     path = path.rstrip(posixpath.sep)
-    while path and path != posixpath.sep:
+    while path.rstrip(posixpath.sep):
         yield path
         path, tail = posixpath.split(path)
 
@@ -2186,6 +2230,17 @@ class CompleteDirs(ZipFile):
         dir_match = name not in names and dirname in names
         return dirname if dir_match else name
 
+    def getinfo(self, name):
+        """
+        Supplement getinfo for implied dirs.
+        """
+        try:
+            return super().getinfo(name)
+        except KeyError:
+            if not name.endswith('/') or name not in self._name_set():
+                raise
+            return ZipInfo(filename=name)
+
     @classmethod
     def make(cls, source):
         """
@@ -2223,6 +2278,11 @@ class FastLookup(CompleteDirs):
             return self.__lookup
         self.__lookup = super(FastLookup, self)._name_set()
         return self.__lookup
+
+
+def _extract_text_encoding(encoding=None, *args, **kwargs):
+    # stacklevel=3 so that the caller of the caller see any warning.
+    return io.text_encoding(encoding, 3), args, kwargs
 
 
 class Path:
@@ -2334,21 +2394,21 @@ class Path:
             if args or kwargs:
                 raise ValueError("encoding args invalid for binary operation")
             return stream
-        else:
-            kwargs["encoding"] = io.text_encoding(kwargs.get("encoding"))
-        return io.TextIOWrapper(stream, *args, **kwargs)
+        # Text mode:
+        encoding, args, kwargs = _extract_text_encoding(*args, **kwargs)
+        return io.TextIOWrapper(stream, encoding, *args, **kwargs)
 
     @property
     def name(self):
-        return pathlib.Path(self.at).name or self.filename.name
+        return pathlib.PurePosixPath(self.at).name or self.filename.name
 
     @property
     def filename(self):
         return pathlib.Path(self.root.filename).joinpath(self.at)
 
     def read_text(self, *args, **kwargs):
-        kwargs["encoding"] = io.text_encoding(kwargs.get("encoding"))
-        with self.open('r', *args, **kwargs) as strm:
+        encoding, args, kwargs = _extract_text_encoding(*args, **kwargs)
+        with self.open('r', encoding, *args, **kwargs) as strm:
             return strm.read()
 
     def read_bytes(self):
