@@ -4,7 +4,7 @@ import sys
 from sklearn.model_selection import train_test_split
 from src.exception import CustomException
 from src.logger import logging
-from src.utils import DataIngestionConfig
+
 import pandas as pd
 from dataclasses import dataclass
 

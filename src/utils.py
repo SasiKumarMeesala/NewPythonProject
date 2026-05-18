@@ -1,41 +1,37 @@
 import os
 import sys
-from src.logger import logging
+import pickle
 from src.exception import CustomException
+from src.logger import logging
+import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from dataclasses import dataclass
-@dataclass
-class DataIngestionConfig:
-    train_data_path: str = os.path.join('artifacts', 'train.csv')
-    test_data_path: str = os.path.join('artifacts', 'test.csv')
-    raw_data_path: str = os.path.join('artifacts', 'data.csv')
+import dill
+import pickle
+def save_object(file_path, obj):
+    try:
+        dir_path = os.path.dirname(file_path)
+        os.makedirs(dir_path, exist_ok=True)
+        with open(file_path, 'wb') as file_obj:
+            pickle.dump(obj, file_obj)
+    except Exception as e:
+        raise CustomException(e, sys)
 
-class DataIngestion:
-    def __init__(self):
-        self.ingestion_config = DataIngestionConfig()
-
-    def initiate_data_ingestion(self):
-        logging.info("Data Ingestion method starts.")
-        try:
-            df = pd.read_csv(os.path.join('notebook', 'data', 'stud.csv'))
-            logging.info("Dataset read as pandas dataframe.")
-            os.makedirs(os.path.dirname(self.ingestion_config.raw_data_path), exist_ok=True)
-            df.to_csv(self.ingestion_config.raw_data_path, index=False)
-            logging.info("Raw data is saved to artifacts folder.")
-            train_set, test_set = train_test_split(df, test_size=0.2, random_state=42)
-            train_set.to_csv(self.ingestion_config.train_data_path, index=False, header=True)
-            test_set.to_csv(self.ingestion_config.test_data_path, index=False, header=True)
-            logging.info("Data Ingestion is completed.")
-            return (
-                self.ingestion_config.train_data_path,
-                self.ingestion_config.test_data_path
-            )
-        except Exception as e:
-            logging.info("Error occurred in Data Ingestion stage.")
-            raise CustomException(e, sys)
-        
-if __name__ == "__main__":
-    obj = DataIngestion()
-    obj.initiate_data_ingestion()
+def load_object(file_path):
+    try:
+        with open(file_path, 'rb') as file_obj:
+            return pickle.load(file_obj)
+    except Exception as e:
+        raise CustomException(e, sys)
+    
+def evaluate_models(X_train, y_train, X_test, y_test, models, params):
+    try:
+        report = {}
+        for i in range(len(models)):
+            model = list(models.values())[i]
+            model.fit(X_train, y_train)
+            y_test_pred = model.predict(X_test)
+            test_model_score = r2_score(y_test, y_test_pred)
+            report[list(models.keys())[i]] = test_model_score
+        return report
+    except Exception as e:
+        raise CustomException(e, sys)
