@@ -1,9 +1,11 @@
+import os
 import sys
 from dataclasses import dataclass
 from src.logger import logging
 from src.exception import CustomException
 import pandas as pd
 import numpy as np
+from src.utils import save_object
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer

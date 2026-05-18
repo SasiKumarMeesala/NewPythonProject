@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import dill
 import pickle
+from sklearn.metrics import r2_score
 def save_object(file_path, obj):
     try:
         dir_path = os.path.dirname(file_path)
